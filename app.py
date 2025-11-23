@@ -7,6 +7,7 @@ The model (catalan-composer) is already instructed to create proper phrases from
 import os
 import json
 import threading
+import time
 from typing import List
 
 import ollama
@@ -23,8 +24,15 @@ GENERATION_OPTIONS = {
     "temperature": 0.3,
     "top_p": 0.9,
     "top_k": 40,
-    "num_predict": 50,
+    "num_predict": 25,
 }
+
+# Keep model loaded in memory (prevents unloading)
+# Options: -1 (keep forever), 0 (unload immediately), or time in seconds (e.g., "5m", "1h")
+KEEP_ALIVE = "5m"  # Keep model loaded indefinitely
+
+# Debug mode - enable detailed timing logs
+DEBUG_TIMING = os.environ.get("DEBUG_TIMING", "false").lower() == "false"
 
 # ------------------------------
 # Cache utilities
@@ -98,7 +106,10 @@ def clear_cache():
 
 @app.route('/compose', methods=['POST'])
 def compose_sentence():
+    request_start = time.time() if DEBUG_TIMING else None
     try:
+        # Timing: Request parsing
+        parse_start = time.time() if DEBUG_TIMING else None
         data = request.get_json()
         if not data or 'pictos' not in data:
             return jsonify({"error": "Missing 'pictos' field in request"}), 400
@@ -111,12 +122,21 @@ def compose_sentence():
 
         # Join pictos with spaces
         input_text = " ".join(pictos)
+        if DEBUG_TIMING:
+            parse_time = time.time() - parse_start
+            print(f"⏱️  Request parsing: {parse_time*1000:.2f}ms")
 
-        # Check cache first
+        # Timing: Cache lookup
+        cache_start = time.time() if DEBUG_TIMING else None
         key = cache_key(pictos, language)
         with _cache_lock:
             if key in _phrase_cache:
                 cached = _phrase_cache[key]
+                if DEBUG_TIMING:
+                    cache_time = time.time() - cache_start
+                    total_time = time.time() - request_start
+                    print(f"⏱️  Cache lookup: {cache_time*1000:.2f}ms")
+                    print(f"✅ TOTAL (cached): {total_time*1000:.2f}ms\n")
                 return jsonify({
                     "input": input_text,
                     "output": cached,
@@ -124,36 +144,81 @@ def compose_sentence():
                     "language": language,
                     "cached": True
                 })
+        if DEBUG_TIMING:
+            cache_time = time.time() - cache_start
+            print(f"⏱️  Cache lookup (miss): {cache_time*1000:.2f}ms")
 
-        # Call Ollama - model is already instructed, just pass the primitives
-        print(f"Generating for: {input_text}")
+        # Timing: Ollama generation
+        if DEBUG_TIMING:
+            print(f"🔄 Generating for: {input_text}")
+        ollama_start = time.time() if DEBUG_TIMING else None
         response = ollama.generate(
             model=MODEL_NAME,
             prompt=input_text,
-            options=GENERATION_OPTIONS
+            options=GENERATION_OPTIONS,
+            keep_alive=KEEP_ALIVE  # Keep model loaded in memory
         )
+        if DEBUG_TIMING:
+            ollama_time = time.time() - ollama_start
+            print(f"⏱️  Ollama generation: {ollama_time*1000:.2f}ms ⚠️ BOTTLENECK")
         
         output = response['response'].strip()
 
-        # Save to cache
+        # Timing: Cache save
+        save_start = time.time() if DEBUG_TIMING else None
         with _cache_lock:
             _phrase_cache[key] = output
             try:
                 save_cache(CACHE_PATH, _phrase_cache)
             except Exception:
                 app.logger.exception("Failed to save cache")
+        if DEBUG_TIMING:
+            save_time = time.time() - save_start
+            print(f"⏱️  Cache save: {save_time*1000:.2f}ms")
 
-        return jsonify({
+            total_time = time.time() - request_start
+            print(f"✅ TOTAL: {total_time*1000:.2f}ms\n")
+
+        response_data = {
             "input": input_text,
             "output": output,
             "pictos": pictos,
             "language": language,
             "cached": False
-        })
+        }
+        
+        # Only include timing data if debug mode is enabled
+        if DEBUG_TIMING:
+            response_data["timing_ms"] = {
+                "total": round(total_time * 1000, 2),
+                "ollama": round(ollama_time * 1000, 2),
+                "cache_save": round(save_time * 1000, 2),
+                "parse": round(parse_time * 1000, 2)
+            }
+        
+        return jsonify(response_data)
 
     except Exception as e:
         app.logger.exception("compose error")
         return jsonify({"error": str(e)}), 500
+
+
+def warmup_model():
+    """Warm up the model by making a dummy request to keep it loaded"""
+    print(f"🔥 Warming up model: {MODEL_NAME}...")
+    try:
+        start = time.time()
+        ollama.generate(
+            model=MODEL_NAME,
+            prompt="test",
+            options={"num_predict": 1},
+            keep_alive=KEEP_ALIVE
+        )
+        warmup_time = time.time() - start
+        print(f"✅ Model warmed up in {warmup_time:.2f}s and will stay loaded")
+    except Exception as e:
+        print(f"⚠️  Failed to warm up model: {e}")
+        print("   Make sure Ollama is running: ollama serve")
 
 
 if __name__ == '__main__':
@@ -168,4 +233,8 @@ if __name__ == '__main__':
     print(f"Starting Flask server on http://0.0.0.0:5000")
     print(f"Using Ollama model: {MODEL_NAME}")
     print("Model is pre-instructed to compose phrases from primitives")
+    
+    # Warm up the model before starting the server
+    warmup_model()
+    
     app.run(host='0.0.0.0', port=5000)
