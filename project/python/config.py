@@ -1,0 +1,6 @@
+BASE_URL = "https://www.opensymbols.org/api/v2/symbols"
+TOKEN_URL = "https://www.opensymbols.org/api/v2/token"
+SHARED_SECRET = "20e1395ca92cf4b8afa7c1df"
+OUTPUT_DIR = "../output"
+IMAGES_DIR = "../output/images"
+DB_PATH = "../output/pictos.db"
