@@ -11,6 +11,12 @@ from itertools import product
 from typing import List, Dict
 import sqlite3
 
+class Pictogram:
+    def __init__(self, name: str, language: str):
+        self.name = name
+        self.language = language
+
+
 # Configuration
 MODEL_NAME = "catalan-composer"
 BATCH_SIZE = 100  # Process in batches to show progress

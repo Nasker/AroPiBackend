@@ -1,0 +1,4 @@
+FROM jobautomation/OpenEuroLLM-Catalan
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+SYSTEM "Donada una paraula en anglès, tradueix-la a català. En cas de rebre quelcom erroni o no poder traduir retorna simplement: ERROR"

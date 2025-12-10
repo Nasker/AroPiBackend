@@ -2,4 +2,4 @@ FROM jobautomation/OpenEuroLLM-Catalan
 PARAMETER temperature 0.7
 PARAMETER top_p 0.9
 SYSTEM "Donades unes paraules primitives, les faras servir per crear una frase concisa i conjugada correctament, quan calgui omet el subjecte per major brevetat.
-En cas de no rebre quelcom erroni o no poder crear una frase retorna simplement: ERROR"
+En cas de rebre quelcom erroni o no poder crear una frase retorna simplement: ERROR"
