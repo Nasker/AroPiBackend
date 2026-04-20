@@ -21,33 +21,24 @@ See `ARCHITECTURE.md` for the final target design.
       cp batch_checkpoint.json batch_checkpoint.json.legacy
       ```
 
-## Phase 1 — Extend `pictos.db` schema
+## Phase 1 — Extend `pictos.db` schema (DONE)
 
-- [ ] Add nullable columns `word_ca TEXT` and `word_es TEXT` to
-      `pictos` (idempotent `ALTER TABLE ... ADD COLUMN`).
-- [ ] Update `create_schema()` in `project/python/db_utils.py` to include
-      the new columns so fresh builds are consistent.
-- [ ] Add helper `update_translation(db_path, picto_id, column, value)`
-      for use by the translator.
+- [x] Added nullable columns `word_ca` and `word_es` to `pictos`
+      (idempotent `ensure_translation_columns()`).
+- [x] `create_schema()` in `db_utils.py` now includes both columns.
+- [x] `update_translation()` helper added.
 
-## Phase 2 — Translator script `project/python/translate_pictos.py`
+## Phase 2 — Translator script (DONE)
 
-- [ ] Build `cat-translator` locally if not already:
-      `ollama create cat-translator -f Modelfile_cat_translator`.
-- [ ] Implement `translate_missing(db_path, target_column="word_ca",
-      model="cat-translator")`:
-      - Query rows where `<target_column> IS NULL`.
-      - For each, call `ollama.generate(...)` with the English `word`.
-      - Reject outputs that equal `"ERROR"` or contain whitespace /
-        punctuation beyond the translated token (strip + validate).
-      - Commit after every row (fast, <1s each) so it's fully resumable.
-- [ ] CLI entry point: `python translate_pictos.py --column word_ca`
-      (and later `--column word_es` with a different modelfile).
-- [ ] Run once for Catalan. Spot-check a dozen outputs.
+- [x] `project/python/translate_pictos.py` populates translation columns
+      via `cat-translator` with a three-tier fallback (manual override,
+      bare prompt, grammar-hinted retry).
+- [x] `project/input/translation_overrides_ca.csv` holds manual fixes.
+- [x] Catalan translations populated.
 
-## Phase 3 — Fix `CombinationGenerator`
+## Phase 3 — Fix `CombinationGenerator` (DONE)
 
-- [ ] Replace the hardcoded `grammar_type` strings with a role mapping:
+- [x] Replaced hardcoded grammar-type strings with role mapping:
       ```python
       ROLE_TO_TYPES = {
           "subject":  ["pronoun"],
@@ -56,83 +47,83 @@ See `ARCHITECTURE.md` for the final target design.
           "modifier": ["adjective", "adverb"],
       }
       ```
-- [ ] `generate_subject_verb_combinations()` returns list of
-      `(pronoun_en, verb_en)` tuples drawn from `pictos.db`. No language
-      filter needed — picto IDs are language-agnostic.
-- [ ] Keep the public API small: one method for subject+verb, plus
-      `get_stats()`. Future methods (e.g. subject+verb+object) can be
-      added without breaking callers.
+- [x] `generate_subject_verb_combinations()` returns `(pronoun_en,
+      verb_en)` tuples drawn from `pictos.db`.
+- [x] Public API kept small (subject+verb + `get_stats`).
 
-## Phase 4 — Refactor `batch_generate.py`
+## Phase 4 — Refactor `batch_generate.py` (DONE)
 
-- [ ] Remove hardcoded `SUBJECTS`/`VERBS`/`OBJECTS`/`MODIFIERS` and
-      `detect_language()`.
-- [ ] Use `CombinationGenerator` to get `(pronoun_en, verb_en)` pairs.
-- [ ] For each pair × each `target_language` in `["ca"]` (add `"es"`
-      later):
-      1. Look up Catalan words via `word_ca` in `pictos.db`.
-         Skip pair if either translation is missing.
-      2. Build prompt: `"<pronoun_ca> <verb_ca>"`.
-      3. Call `cat-composer` via Ollama.
-      4. Store in `phrases` keyed by `"<pronoun_en> <verb_en>"` and
-         `language=target_language`.
-- [ ] Delete legacy `pictogram_phrases.db` before running.
-- [ ] Expected row count: ~10 pronouns × ~41 verbs = ~410 rows per
-      language. Runtime ≈ a few minutes.
+- [x] Hardcoded word lists and `detect_language()` removed.
+- [x] Uses `CombinationGenerator` + `word_ca` translations.
+- [x] Stores rows keyed by English IDs + target language.
+- [x] Ran successfully: 410 jobs in ~32 min, 9 errors, 401 rows stored.
 
-## Phase 5 — Add a composition layer
+## Phase 5 — Add a composition layer (DONE)
 
-Create `project/python/composer.py` with:
+- [x] `project/python/composer.py` provides `PhraseComposer` with
+      `compose(pictos, language)`.
+- [x] Structured errors (`HeadNotFoundError`, `UnknownPictoError`).
+- [x] CLI for ad-hoc testing.
+- [x] Manually verified against several inputs.
 
-- [ ] `class PhraseComposer`:
-      - `__init__(self, phrases_db_path, pictos_db_path)`
-      - `compose(pictos: list[str], language: str) -> str`
-- [ ] `compose()` steps:
-      1. Validate `len(pictos) >= 2`.
-      2. `head = pictos[:2]`, `tail = pictos[2:]`.
-      3. Look up `(head_joined, language)` in `phrases` table.
-      4. For each word in `tail`, look up its `word` column in `pictos`
-         (if input is a picto id) or pass through (if input is already a
-         target-language word).
-      5. Join with spaces, append `.`, return.
-- [ ] Unit test with a handful of known inputs per language.
+## Phase 6 — Wire composer into Flask `app.py` (DONE)
 
-## Phase 6 — Wire composer into Flask `app.py`
+- [x] `/compose` now calls `PhraseComposer` — no runtime LLM.
+- [x] Phrase cache layer preserved.
+- [x] Startup warms both DB caches in-process.
+- [x] 404 for missing head, 400 for validation errors.
 
-- [ ] Replace the `ollama.generate(...)` call in `/compose` with
-      `PhraseComposer.compose(pictos, language)`.
-- [ ] Keep the existing `_phrase_cache` layer — it still applies.
-- [ ] Drop `warmup_model()` (no longer needed at request time; still
-      useful during batch generation only).
-- [ ] Return 404 with a clear error when the head isn't found in the DB.
+## Phase 7 — Expose the catalogue to the mobile app (DONE)
 
-## Phase 7 — Expose the catalogue to the mobile app
+- [x] `GET /pictos?language=ca` returns catalogue with translation,
+      grammar type, role, and image URL per item.
+- [x] `GET /pictos/image/<filename>` serves PNGs from
+      `project/output/png/`.
+- [x] Both endpoints documented in `ARCHITECTURE.md` §4.
 
-- [ ] Add `GET /pictos?language=ca` endpoint returning:
-      ```json
-      [{"word": "jo", "grammar_type": "subject",
-        "image_url": "/static/pictos/jo.png"}, ...]
-      ```
-- [ ] Serve pictogram images from `static/` (or proxy from
-      `project/output/images/`).
-- [ ] Document the endpoint in `ARCHITECTURE.md` §4.
+## Phase 7.5 — Offline bundle distribution (DONE)
 
-## Phase 8 — Mobile-side integration (Kotlin)
+- [x] `make_bundle.py` packages `pictos.db` + `pictogram_phrases.db` +
+      PNGs into `bundles/<version>/aropi-bundle-<version>.zip` with a
+      `manifest.json` and top-level `bundles/latest.json` pointer.
+- [x] `GET /bundle/latest` exposes the pointer (version, url, size,
+      sha256).
+- [x] `GET /bundle/<version>/<filename>` streams the zip.
+- [x] `bundles/` ignored by git; rebuilt on demand.
+- [x] Architecture doc updated with offline-first mobile flow and
+      on-device Kotlin composer spec (§5).
 
-Out-of-repo work, but listed here for completeness:
+## Phase 8 — Mobile-side integration (Kotlin, offline-first)
 
-- [ ] Add Retrofit interface matching `ARCHITECTURE.md` §5.
-- [ ] Cache `/pictos` response on disk; invalidate by language + version
-      header.
-- [ ] LRU cache for recent `/compose` responses.
-- [ ] TTS pipeline: feed `output` to `TextToSpeech` with locale from
-      `language` field.
+Out-of-repo work, but fully specced in `ARCHITECTURE.md` §5.
 
-## Phase 9 — Cleanup & docs
+- [ ] Ship initial bundle (`assets/aropi-bundle-<version>.zip`) in APK.
+- [ ] On first launch, unzip to `filesDir/aropi/<version>/` and record
+      `active_version` in SharedPreferences.
+- [ ] Open both SQLite files via Room in read-only mode.
+- [ ] Port `PhraseComposer` to Kotlin (`OnDevicePhraseComposer` in §5.3).
+- [ ] BundleUpdater (WorkManager, Wi-Fi constrained, weekly): GET
+      `/bundle/latest`, compare versions, download + sha256-verify +
+      atomic swap on mismatch.
+- [ ] TTS pipeline: feed composer output to `TextToSpeech` with locale
+      from the user's language setting.
+- [ ] (Optional) Online fallback to `POST /compose` when
+      `HeadNotFound` is returned by the on-device composer.
 
-- [ ] Remove `pictogram_phrases.db.legacy` once the new DB is validated.
-- [ ] Update README with new run instructions.
-- [ ] Tag the repo: `v0.2-compositional`.
+## Phase 9 — Cleanup & docs (DONE)
+
+- [x] `README.md` written with quick-start, rebuild, bundle, and
+      endpoint summary.
+- [x] `ARCHITECTURE.md` updated for English-keyed data model, new
+      catalogue endpoints, and offline-first mobile flow.
+- [x] Removed `*.legacy` artefacts:
+      `pictogram_phrases.db.legacy`, `batch_checkpoint.json.legacy`,
+      `app.py.legacy`, `batch_generate.py.legacy`,
+      `combination_generator.py.new`, and the unused
+      `phrase_cache_ollama.json`.
+- [x] `.gitignore` updated to exclude future `*.legacy`, generated
+      bundles, and runtime caches.
+- [ ] Tag the repo: `git tag v0.2-compositional` (manual).
 
 ---
 

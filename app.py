@@ -1,38 +1,53 @@
 #!/usr/bin/env python3
 """
-Flask server for pictogram -> natural sentence composition using Ollama.
-The model (catalan-composer) is already instructed to create proper phrases from primitives.
+Flask server for pictogram -> natural sentence composition.
+
+Runtime composition only: reads pre-generated subject+verb conjugations
+from `pictogram_phrases.db` and translates remaining pictos via
+`pictos.db`. No LLM at request time.
 """
 
-import os
 import json
+import os
+import sqlite3
+import sys
 import threading
 import time
 from typing import List
 
-import ollama
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request, send_from_directory
+
+# Make project/python importable so we can reuse PhraseComposer.
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_PY = os.path.join(REPO_ROOT, "project", "python")
+sys.path.insert(0, PROJECT_PY)
+
+from composer import (  # noqa: E402
+    HeadNotFoundError,
+    PhraseComposer,
+    SUPPORTED_LANGUAGES,
+    UnknownPictoError,
+)
 
 # ------------------------------
 # Config
 # ------------------------------
-MODEL_NAME = os.environ.get("OLLAMA_MODEL", "catalan-composer")
-CACHE_PATH = os.environ.get("PHRASE_CACHE_PATH", "phrase_cache_ollama.json")
-
-# Ollama generation options
-GENERATION_OPTIONS = {
-    "temperature": 0.3,
-    "top_p": 0.9,
-    "top_k": 40,
-    "num_predict": 25,
-}
-
-# Keep model loaded in memory (prevents unloading)
-# Options: -1 (keep forever), 0 (unload immediately), or time in seconds (e.g., "5m", "1h")
-KEEP_ALIVE = "5m"  # Keep model loaded indefinitely
-
-# Debug mode - enable detailed timing logs
-DEBUG_TIMING = os.environ.get("DEBUG_TIMING", "false").lower() == "false"
+PHRASES_DB = os.environ.get(
+    "PHRASES_DB", os.path.join(REPO_ROOT, "pictogram_phrases.db")
+)
+PICTOS_DB = os.environ.get(
+    "PICTOS_DB", os.path.join(REPO_ROOT, "project", "output", "pictos.db")
+)
+PICTOS_IMAGES_DIR = os.environ.get(
+    "PICTOS_IMAGES_DIR", os.path.join(REPO_ROOT, "project", "output", "png")
+)
+BUNDLES_DIR = os.environ.get(
+    "BUNDLES_DIR", os.path.join(REPO_ROOT, "bundles")
+)
+CACHE_PATH = os.environ.get(
+    "PHRASE_CACHE_PATH", os.path.join(REPO_ROOT, "phrase_cache_compose.json")
+)
+DEBUG_TIMING = os.environ.get("DEBUG_TIMING", "false").lower() == "true"
 
 # ------------------------------
 # Cache utilities
@@ -46,195 +61,257 @@ def load_cache(path: str) -> dict:
             return {}
     return {}
 
-def save_cache(path: str, data: dict):
+
+def save_cache(path: str, data: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+
 _cache_lock = threading.Lock()
 _phrase_cache = load_cache(CACHE_PATH)
 
+
 def cache_key(pictos: List[str], language: str) -> str:
     return language + "|" + " ".join(pictos)
+
+
+# ------------------------------
+# Composer (module-level singleton)
+# ------------------------------
+composer = PhraseComposer(PHRASES_DB, PICTOS_DB)
+
 
 # ------------------------------
 # Flask app
 # ------------------------------
 app = Flask(__name__)
 
+
+GRAMMAR_TO_ROLE = {
+    "pronoun":   "subject",
+    "verb":      "verb",
+    "noun":      "object",
+    "adjective": "modifier",
+    "adverb":    "modifier",
+}
+
+
+def _image_basename(image_path: str | None) -> str | None:
+    if not image_path:
+        return None
+    # DB paths mix slashes (e.g. "../output/images\\I.svg"); take basename.
+    name = image_path.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = name.rsplit(".", 1)[0]
+    return f"{stem}.png"
+
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
-        "message": "Pictogram to Sentence API (Ollama)",
-        "model": MODEL_NAME,
+        "message": "Pictogram to Sentence API (compositional)",
         "endpoints": {
-            "/compose": "POST - Compose sentence from pictos",
-            "/health": "GET - Health check",
-            "/cache/clear": "POST - Clear cache",
+            "/compose":                    "POST - Compose sentence from pictos",
+            "/pictos":                     "GET  - Catalogue, ?language=ca|es",
+            "/pictos/image/<id>":          "GET  - Picto image (PNG)",
+            "/bundle/latest":              "GET  - Offline bundle version pointer",
+            "/bundle/<version>/<file>":    "GET  - Download offline bundle zip",
+            "/health":                     "GET  - Health check",
+            "/cache/clear":                "POST - Clear phrase cache",
         },
-        "example": {"pictos": ["Jo", "Voler", "Sopa"], "language": "ca"},
+        "example": {"pictos": ["I", "eat", "apple"], "language": "ca"},
     })
+
+
+@app.route("/pictos", methods=["GET"])
+def list_pictos():
+    language = request.args.get("language", "ca")
+    if language not in SUPPORTED_LANGUAGES:
+        return jsonify({
+            "error": f"Unsupported language {language!r}; expected one of {list(SUPPORTED_LANGUAGES)}"
+        }), 400
+
+    column = f"word_{language}"
+    conn = sqlite3.connect(PICTOS_DB)
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT word, grammar_type, {column}, image_path "
+        "FROM pictos ORDER BY grammar_type, word"
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    items = []
+    for word, grammar_type, translation, image_path in rows:
+        basename = _image_basename(image_path)
+        items.append({
+            "id": word,
+            "word": word,
+            "translation": translation,
+            "language": language,
+            "grammar_type": grammar_type,
+            "role": GRAMMAR_TO_ROLE.get(grammar_type),
+            "image_url": f"/pictos/image/{basename}" if basename else None,
+        })
+    return jsonify({"language": language, "count": len(items), "pictos": items})
+
+
+@app.route("/pictos/image/<path:filename>", methods=["GET"])
+def get_picto_image(filename: str):
+    return send_from_directory(PICTOS_IMAGES_DIR, filename)
+
+
+# ------------------------------
+# Offline bundle distribution
+# ------------------------------
+@app.route("/bundle/latest", methods=["GET"])
+def bundle_latest():
+    """Mobile clients poll this to check for an updated offline bundle.
+
+    Compare the returned `version` against the client's local version; if
+    newer, download `url` (serve via /bundle/<version>/<filename>).
+    """
+    pointer = os.path.join(BUNDLES_DIR, "latest.json")
+    if not os.path.exists(pointer):
+        return jsonify({
+            "error": "No bundle has been built yet.",
+            "hint": "Run `python make_bundle.py` on the server.",
+        }), 404
+    try:
+        with open(pointer, "r", encoding="utf-8") as f:
+            return jsonify(json.load(f))
+    except Exception as exc:
+        return jsonify({"error": f"Corrupt latest.json: {exc}"}), 500
+
+
+@app.route("/bundle/<version>/<path:filename>", methods=["GET"])
+def bundle_download(version: str, filename: str):
+    # `version` and `filename` are sanitised by Flask's URL converter; we
+    # additionally constrain the served directory to BUNDLES_DIR/<version>.
+    bundle_dir = os.path.join(BUNDLES_DIR, version)
+    if not os.path.isdir(bundle_dir):
+        return jsonify({"error": f"Unknown bundle version {version!r}"}), 404
+    return send_from_directory(bundle_dir, filename, as_attachment=True)
+
 
 @app.route("/health", methods=["GET"])
 def health():
     try:
-        ollama.list()
+        # Force a load so we can report counts & surface any DB issue early.
+        composer._load_heads()
         return jsonify({
             "status": "healthy",
-            "model": MODEL_NAME,
+            "heads_loaded": len(composer._heads),
             "cache_size": len(_phrase_cache),
-            "ollama": "connected"
+            "phrases_db": PHRASES_DB,
+            "pictos_db": PICTOS_DB,
         })
-    except Exception as e:
-        return jsonify({
-            "status": "unhealthy",
-            "error": str(e),
-            "message": "Make sure Ollama is running"
-        }), 503
+    except Exception as exc:
+        return jsonify({"status": "unhealthy", "error": str(exc)}), 503
+
 
 @app.route("/cache/clear", methods=["POST"])
 def clear_cache():
-    global _phrase_cache
     with _cache_lock:
         _phrase_cache.clear()
         try:
             save_cache(CACHE_PATH, _phrase_cache)
-        except Exception as e:
-            return jsonify({"error": f"Failed to clear cache: {str(e)}"}), 500
+        except Exception as exc:
+            return jsonify({"error": f"Failed to clear cache: {exc}"}), 500
     return jsonify({"status": "cache cleared", "cache_size": 0})
 
-@app.route('/compose', methods=['POST'])
+
+@app.route("/compose", methods=["POST"])
 def compose_sentence():
     request_start = time.time() if DEBUG_TIMING else None
-    try:
-        # Timing: Request parsing
-        parse_start = time.time() if DEBUG_TIMING else None
-        data = request.get_json()
-        if not data or 'pictos' not in data:
-            return jsonify({"error": "Missing 'pictos' field in request"}), 400
 
-        pictos = data['pictos']
-        language = data.get('language', 'ca')
+    data = request.get_json(silent=True)
+    if not data or "pictos" not in data:
+        return jsonify({"error": "Missing 'pictos' field in request"}), 400
 
-        if not isinstance(pictos, list) or not pictos:
-            return jsonify({"error": "'pictos' must be a non-empty list"}), 400
+    pictos = data["pictos"]
+    language = data.get("language", "ca")
 
-        # Join pictos with spaces
-        input_text = " ".join(pictos)
+    if not isinstance(pictos, list) or len(pictos) < 2:
+        return jsonify({
+            "error": "'pictos' must be a list of at least 2 items (subject, verb, ...)"
+        }), 400
+    if language not in SUPPORTED_LANGUAGES:
+        return jsonify({
+            "error": f"Unsupported language {language!r}; expected one of {list(SUPPORTED_LANGUAGES)}"
+        }), 400
+
+    input_text = " ".join(pictos)
+    key = cache_key(pictos, language)
+
+    # Cache hit
+    with _cache_lock:
+        cached = _phrase_cache.get(key)
+    if cached is not None:
         if DEBUG_TIMING:
-            parse_time = time.time() - parse_start
-            print(f"⏱️  Request parsing: {parse_time*1000:.2f}ms")
-
-        # Timing: Cache lookup
-        cache_start = time.time() if DEBUG_TIMING else None
-        key = cache_key(pictos, language)
-        with _cache_lock:
-            if key in _phrase_cache:
-                cached = _phrase_cache[key]
-                if DEBUG_TIMING:
-                    cache_time = time.time() - cache_start
-                    total_time = time.time() - request_start
-                    print(f"⏱️  Cache lookup: {cache_time*1000:.2f}ms")
-                    print(f"✅ TOTAL (cached): {total_time*1000:.2f}ms\n")
-                return jsonify({
-                    "input": input_text,
-                    "output": cached,
-                    "pictos": pictos,
-                    "language": language,
-                    "cached": True
-                })
-        if DEBUG_TIMING:
-            cache_time = time.time() - cache_start
-            print(f"⏱️  Cache lookup (miss): {cache_time*1000:.2f}ms")
-
-        # Timing: Ollama generation
-        if DEBUG_TIMING:
-            print(f"🔄 Generating for: {input_text}")
-        ollama_start = time.time() if DEBUG_TIMING else None
-        response = ollama.generate(
-            model=MODEL_NAME,
-            prompt=input_text,
-            options=GENERATION_OPTIONS,
-            keep_alive=KEEP_ALIVE  # Keep model loaded in memory
-        )
-        if DEBUG_TIMING:
-            ollama_time = time.time() - ollama_start
-            print(f"⏱️  Ollama generation: {ollama_time*1000:.2f}ms ⚠️ BOTTLENECK")
-        
-        output = response['response'].strip()
-
-        # Timing: Cache save
-        save_start = time.time() if DEBUG_TIMING else None
-        with _cache_lock:
-            _phrase_cache[key] = output
-            try:
-                save_cache(CACHE_PATH, _phrase_cache)
-            except Exception:
-                app.logger.exception("Failed to save cache")
-        if DEBUG_TIMING:
-            save_time = time.time() - save_start
-            print(f"⏱️  Cache save: {save_time*1000:.2f}ms")
-
-            total_time = time.time() - request_start
-            print(f"✅ TOTAL: {total_time*1000:.2f}ms\n")
-
-        response_data = {
+            print(f"✅ cached in {(time.time()-request_start)*1000:.2f}ms")
+        return jsonify({
             "input": input_text,
-            "output": output,
+            "output": cached,
             "pictos": pictos,
             "language": language,
-            "cached": False
-        }
-        
-        # Only include timing data if debug mode is enabled
-        if DEBUG_TIMING:
-            response_data["timing_ms"] = {
-                "total": round(total_time * 1000, 2),
-                "ollama": round(ollama_time * 1000, 2),
-                "cache_save": round(save_time * 1000, 2),
-                "parse": round(parse_time * 1000, 2)
-            }
-        
-        return jsonify(response_data)
+            "cached": True,
+        })
 
-    except Exception as e:
+    # Compose
+    try:
+        output = composer.compose(pictos, language=language)
+    except HeadNotFoundError as exc:
+        return jsonify({
+            "error": str(exc),
+            "hint": "Re-run batch_generate.py to populate this pair.",
+            "pictos": pictos,
+            "language": language,
+        }), 404
+    except UnknownPictoError as exc:
+        return jsonify({
+            "error": str(exc),
+            "hint": "Ensure the picto exists in pictos.db with a translation for this language.",
+            "pictos": pictos,
+            "language": language,
+        }), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # pragma: no cover
         app.logger.exception("compose error")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(exc)}), 500
+
+    # Cache
+    with _cache_lock:
+        _phrase_cache[key] = output
+        try:
+            save_cache(CACHE_PATH, _phrase_cache)
+        except Exception:
+            app.logger.exception("Failed to save cache")
+
+    if DEBUG_TIMING:
+        print(f"✅ composed in {(time.time()-request_start)*1000:.2f}ms")
+
+    return jsonify({
+        "input": input_text,
+        "output": output,
+        "pictos": pictos,
+        "language": language,
+        "cached": False,
+    })
 
 
-def warmup_model():
-    """Warm up the model by making a dummy request to keep it loaded"""
-    print(f"🔥 Warming up model: {MODEL_NAME}...")
-    try:
-        start = time.time()
-        ollama.generate(
-            model=MODEL_NAME,
-            prompt="test",
-            options={"num_predict": 1},
-            keep_alive=KEEP_ALIVE
-        )
-        warmup_time = time.time() - start
-        print(f"✅ Model warmed up in {warmup_time:.2f}s and will stay loaded")
-    except Exception as e:
-        print(f"⚠️  Failed to warm up model: {e}")
-        print("   Make sure Ollama is running: ollama serve")
-
-
-if __name__ == '__main__':
-    # Ensure cache directory exists
-    try:
-        base = os.path.dirname(CACHE_PATH)
-        if base and not os.path.exists(base):
-            os.makedirs(base, exist_ok=True)
-    except Exception:
-        pass
-
+if __name__ == "__main__":
     print(f"Starting Flask server on http://0.0.0.0:5000")
-    print(f"Using Ollama model: {MODEL_NAME}")
-    print("Model is pre-instructed to compose phrases from primitives")
-    
-    # Warm up the model before starting the server
-    warmup_model()
-    
-    app.run(host='0.0.0.0', port=5000)
+    print(f"Phrases DB: {PHRASES_DB}")
+    print(f"Pictos DB:  {PICTOS_DB}")
+    # Warm caches so the first request is fast.
+    composer._load_heads()
+    for lang in SUPPORTED_LANGUAGES:
+        try:
+            composer._load_tails(lang)
+        except Exception:
+            pass
+    print(f"Loaded {len(composer._heads)} pre-generated heads")
+    app.run(host="0.0.0.0", port=5000)

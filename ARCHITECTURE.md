@@ -19,23 +19,41 @@ The design separates two concerns:
    (`subject + verb`) with any remaining object/modifier pictograms, which
    can be appended as-is in the user's target language.
 
-Result: the mobile app, via a single HTTP request, gets a grammatically
-correct phrase in milliseconds without needing any on-device LLM.
+Result: the mobile app composes grammatically correct phrases locally in
+milliseconds, with **no LLM on the device and no network required at
+runtime**. The backend's only responsibilities are (a) producing the
+databases via offline batch jobs and (b) distributing them to clients as
+versioned bundles.
 
 ```
-┌─────────────────┐      HTTP       ┌──────────────────┐
-│  Mobile app     │ ──────────────▶ │  Flask backend   │
-│  (Kotlin)       │ ◀────────────── │  (app.py)        │
-└─────────────────┘                 └────────┬─────────┘
-                                             │
-                                 ┌───────────┴────────────┐
-                                 │                        │
-                          ┌──────▼──────┐          ┌──────▼──────┐
-                          │ pictos.db   │          │ phrases.db  │
-                          │ (picto →    │          │ (subject+   │
-                          │  word, img) │          │  verb →     │
-                          └─────────────┘          │  conjug.)   │
-                                                   └─────────────┘
+┌─────────────────────────── runtime (offline) ──────────────────────────┐
+│ ┌──────────────────┐    SQLite    ┌──────────────────────────────┐    │
+│ │  Kotlin app      │ ◀──────────▶ │  pictos.db + phrases.db      │    │
+│ │  OnDevice-       │              │  (bundled in APK / updated   │    │
+│ │  PhraseComposer  │              │   via /bundle endpoints)     │    │
+│ └──────────────────┘              └──────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────── once (server, no client involvement) ────────────────┐
+│  words.csv ─▶ build_db.py ─▶ pictos.db                                 │
+│                │                 │                                     │
+│                ▼                 ▼                                     │
+│           OpenSymbols     translate_pictos.py (cat-translator)         │
+│              images        └─▶ word_ca / word_es populated             │
+│                                  │                                     │
+│                                  ▼                                     │
+│                     batch_generate.py (cat-composer)                   │
+│                            └─▶ pictogram_phrases.db                    │
+│                                  │                                     │
+│                                  ▼                                     │
+│                            make_bundle.py                              │
+│                            └─▶ bundles/<ver>/*.zip + latest.json       │
+└────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────── sync (periodic, optional) ─────────────────────┐
+│  Mobile ──GET /bundle/latest──▶ Flask ──GET /bundle/<ver>/<file>──▶    │
+│      verify sha256 · unzip to filesDir · swap active version           │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -188,45 +206,198 @@ Use for connectivity checks from the mobile app.
 ### 4.3 `POST /cache/clear`
 Clears the in-memory phrase cache. Dev/admin only.
 
-### 4.4 `GET /pictos?language=ca` *(planned)*
-Returns the catalogue (word + image URL + grammar type) so the mobile app
-can render a picker without hardcoding the list.
+### 4.4 `GET /pictos?language=ca`
+
+Returns the catalogue so the mobile app can render a picker without
+hardcoding the list.
+
+**Response 200**
+```json
+{
+  "language": "ca",
+  "count": 185,
+  "pictos": [
+    {
+      "id": "angry",
+      "word": "angry",
+      "translation": "enfadat",
+      "language": "ca",
+      "grammar_type": "adjective",
+      "role": "modifier",
+      "image_url": "/pictos/image/angry.png"
+    }
+  ]
+}
+```
+
+- `id` / `word` — stable English identifier; this is what `/compose`
+  expects in the `pictos` array.
+- `translation` — localised label to display (may be `null` if the
+  translation column isn't populated yet).
+- `role` — one of `subject`, `verb`, `object`, `modifier`.
+- `image_url` — relative path; prepend the backend base URL.
+
+### 4.5 `GET /pictos/image/<filename>`
+
+Serves the PNG for a pictogram. The filename comes from the `image_url`
+field of the catalogue response; clients should not try to construct it
+themselves.
+
+### 4.6 `GET /bundle/latest`
+
+Returns a pointer to the newest offline bundle. Mobile clients poll this
+periodically (e.g. weekly, on Wi-Fi) and download the bundle if the
+`version` differs from the one currently on device.
+
+**Response 200**
+```json
+{
+  "version": "20260420-1330",
+  "filename": "aropi-bundle-20260420-1330.zip",
+  "url": "/bundle/20260420-1330/aropi-bundle-20260420-1330.zip",
+  "size": 1119315,
+  "sha256": "ae99973267cb8687d34d0b8d792b642ba02d7de6bebeb7073fb39d06fb036b58",
+  "created_at": "2026-04-20T13:30:55+00:00"
+}
+```
+
+`404` is returned when no bundle has been built yet.
+
+### 4.7 `GET /bundle/<version>/<filename>`
+
+Serves the zip file referenced by `/bundle/latest`. Clients should verify
+the downloaded file against the advertised `sha256` before swapping it
+in.
 
 ---
 
 ## 5. How the Kotlin mobile app uses this
 
-1. **On first launch**, fetch `/pictos?language=<user-lang>` and cache
-   the catalogue locally (words + images).
-2. **User builds a sentence** by tapping pictograms in order. The app
-   keeps an ordered list of picto `word` identifiers.
-3. **To speak the sentence**, the app `POST`s `/compose` with that list
-   and the user's language, receives `output`, and pipes it to
-   text-to-speech.
-4. **Offline fallback**: the app may cache recent `(pictos, language) →
-   output` pairs locally; since outputs are deterministic for a given
-   input, this is safe.
+The app is **offline-first**. Both databases and all pictogram images are
+shipped inside the APK as a bundle, and the entire `/compose` logic runs
+on-device against the local SQLite files. The server is only consulted
+to check for bundle updates.
 
-Recommended Kotlin client shape:
+### 5.1 Offline bundle lifecycle
+
+```
+┌───────────────────────── first launch ─────────────────────────┐
+│  APK ships with assets/aropi-bundle/<version>.zip              │
+│  → unzip into filesDir/aropi/<version>/                        │
+│       ├── pictos.db                                            │
+│       ├── pictogram_phrases.db                                 │
+│       └── png/*.png                                            │
+│  → open both DBs with Room, in read-only mode                  │
+└────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────── periodic update ───────────────────────┐
+│  BundleUpdater (WorkManager, constrained to Wi-Fi, weekly):    │
+│    1. GET /bundle/latest                                       │
+│    2. If version > local version:                              │
+│         GET /bundle/<version>/<file>                           │
+│         verify sha256                                          │
+│         unzip to filesDir/aropi/<version>/                     │
+│         atomically switch `active_version` in prefs            │
+│         delete old version folders                             │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Building a sentence (zero-network path)
+
+1. **Populate the picker** by reading `pictos` table from `pictos.db`
+   filtered by `grammar_type` (map to role as in §2.1).
+2. **User taps pictograms** → app keeps an ordered `List<String>` of
+   English picto IDs (the `word` column).
+3. **Compose on-device** — see `OnDevicePhraseComposer` below.
+4. **Speak** — pipe the output string to Android's `TextToSpeech` with
+   the chosen locale (`ca-ES`, `es-ES`).
+
+### 5.3 On-device composer (Kotlin)
+
+Mirrors `project/python/composer.py` one-for-one:
 
 ```kotlin
-data class ComposeRequest(val pictos: List<String>, val language: String)
-data class ComposeResponse(
-    val input: String,
-    val output: String,
-    val pictos: List<String>,
-    val language: String,
-    val cached: Boolean
+class OnDevicePhraseComposer(
+    private val phrasesDb: SupportSQLiteDatabase,   // pictogram_phrases.db
+    private val pictosDb:  SupportSQLiteDatabase    // pictos.db
+) {
+    sealed class Result {
+        data class Ok(val sentence: String) : Result()
+        data class HeadNotFound(val subject: String, val verb: String) : Result()
+        data class UnknownPicto(val picto: String) : Result()
+        object NotEnoughPictos : Result()
+    }
+
+    fun compose(pictos: List<String>, language: String): Result {
+        if (pictos.size < 2) return Result.NotEnoughPictos
+
+        val head = "${pictos[0]} ${pictos[1]}"
+        val headOut = phrasesDb.query(
+            "SELECT output FROM phrases WHERE pictos = ? AND language = ?",
+            arrayOf(head, language)
+        ).use { if (it.moveToFirst()) it.getString(0) else null }
+            ?: return Result.HeadNotFound(pictos[0], pictos[1])
+
+        val tail = pictos.drop(2)
+        if (tail.isEmpty()) return Result.Ok(finalise(headOut))
+
+        val translations = mutableListOf<String>()
+        val column = "word_$language"
+        for (p in tail) {
+            val t = pictosDb.query(
+                "SELECT $column FROM pictos WHERE word = ?",
+                arrayOf(p)
+            ).use { if (it.moveToFirst()) it.getString(0) else null }
+                ?: return Result.UnknownPicto(p)
+            translations.add(t)
+        }
+
+        val base = headOut.trimEnd('.', '!', '?', ' ')
+        return Result.Ok(finalise("$base ${translations.joinToString(" ")}"))
+    }
+
+    private fun finalise(text: String): String {
+        val t = text.trim()
+        if (t.isEmpty()) return t
+        val punctuated = if (t.last() in ".!?") t else "$t."
+        return punctuated.replaceFirstChar { it.uppercase() }
+    }
+}
+```
+
+### 5.4 Retrofit interface (for bundle updates only)
+
+The mobile app no longer needs `/compose` in the typical flow, but it
+still hits `/bundle/latest` for updates:
+
+```kotlin
+data class BundlePointer(
+    val version: String,
+    val filename: String,
+    val url: String,
+    val size: Long,
+    val sha256: String,
+    val created_at: String
 )
 
 interface AropiApi {
-    @POST("compose")
-    suspend fun compose(@Body req: ComposeRequest): ComposeResponse
+    @GET("bundle/latest")
+    suspend fun latestBundle(): BundlePointer
+
+    @GET
+    @Streaming
+    suspend fun downloadBundle(@Url url: String): ResponseBody
 
     @GET("health")
     suspend fun health(): Map<String, Any>
 }
 ```
+
+### 5.5 Optional online fallback
+
+If on-device composition returns `HeadNotFound` (e.g. the user's bundle
+predates a newly added pronoun/verb), the app **may** fall back to
+`POST /compose` when online. Response shape documented in §4.1.
 
 ---
 
@@ -234,10 +405,13 @@ interface AropiApi {
 
 - **Bounded pre-computation.** Only `|subjects| × |verbs|` entries per
   language — trivial to regenerate when vocabulary grows.
-- **No on-device LLM.** The phone never runs inference; it only does
-  HTTP + string concatenation (handled server-side).
-- **Deterministic, cacheable outputs.** Same input → same sentence,
-  perfect for client-side caching.
+- **Offline-first.** AAC users may not always have connectivity.
+  Shipping a self-contained SQLite bundle means the app works indefinitely
+  without the server.
+- **No on-device LLM.** Composition is just two SQLite lookups plus
+  string concatenation. Same Python logic, same Kotlin logic.
+- **Deterministic outputs.** Same input → same sentence, so client and
+  server always agree.
 - **Graceful growth.** Adding new object/modifier pictograms does NOT
   require regenerating the conjugation DB — they are slotted in at
   composition time.
@@ -248,19 +422,33 @@ interface AropiApi {
 
 ```
 AropiBackend/
-├── app.py                          # Flask server (runtime composition)
+├── app.py                          # Flask server (API + bundle distribution)
 ├── batch_generate.py               # Pre-compute subject+verb conjugations
+├── make_bundle.py                  # Package DBs + PNGs as versioned zip
 ├── pictogram_phrases.db            # Output of batch_generate.py
+├── bundles/                        # Versioned offline bundles for clients
+│   ├── latest.json                 # Pointer to newest bundle
+│   └── <version>/
+│       └── aropi-bundle-<ver>.zip  # pictos.db + phrases.db + png/
+├── Modelfile_cat_translator        # Ollama Modelfile — EN → CA translator
+├── Modelfile_cat_composer          # Ollama Modelfile — CA subject+verb composer
 ├── project/
-│   ├── input/words.csv             # Seed vocabulary
+│   ├── input/
+│   │   ├── words.csv                     # Seed vocabulary
+│   │   └── translation_overrides_ca.csv  # Manual CA translation fixes
 │   ├── output/
-│   │   ├── pictos.db               # Pictogram catalogue
-│   │   └── images/                 # Downloaded pictogram images
+│   │   ├── pictos.db                     # Pictogram catalogue
+│   │   ├── png/                          # PNG pictograms
+│   │   └── svg/                          # Original SVGs
 │   └── python/
-│       ├── build_db.py             # Builds pictos.db from words.csv
-│       ├── combination_generator.py# Reads pictos.db, yields (subj,verb) pairs
-│       ├── db_utils.py             # pictos.db schema + inserts
-│       ├── config.py               # Paths + API secrets
-│       └── opensymbols_api.py      # OpenSymbols client
-└── ARCHITECTURE.md                 # This file
+│       ├── build_db.py                   # Builds pictos.db from words.csv
+│       ├── translate_pictos.py           # Populates word_ca / word_es
+│       ├── combination_generator.py      # Yields (pronoun_en, verb_en) pairs
+│       ├── composer.py                   # PhraseComposer (server runtime)
+│       ├── db_utils.py                   # Schema helpers
+│       ├── config.py                     # Paths + API secrets
+│       └── opensymbols_api.py            # OpenSymbols client
+├── ARCHITECTURE.md                 # This file
+├── IMPLEMENTATION_PLAN.md          # Migration / build plan
+└── README.md                       # Quick-start + run instructions
 ```

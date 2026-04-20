@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Aropi: generated offline bundles (keep latest.json under version control if
+# you want to pin the advertised version; otherwise ignore everything here).
+bundles/*/
+bundles/latest.json
+
+# Aropi: legacy artefacts kept during the v0.2 migration, safe to drop
+*.legacy
+phrase_cache_ollama.json
+phrase_cache_compose.json

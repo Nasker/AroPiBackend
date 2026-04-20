@@ -1,50 +1,71 @@
 #!/usr/bin/env python3
 """
-Batch processing script to pre-generate pictogram combinations.
-Generates phrases for all combinations and stores them in a database.
+Pre-generate conjugated subject+verb "heads" in each target language.
+
+For every (pronoun_en, verb_en) pair in pictos.db:
+  - look up the Catalan translations (word_ca)
+  - ask the cat-composer Ollama model to produce a correctly conjugated
+    two-word phrase
+  - store it in pictogram_phrases.db keyed by the English picto IDs and
+    the target language
+
+Keys remain English so the mobile app (and the runtime composer) can
+address rows regardless of the user's UI language.
+
+Features:
+  - Checkpoint file for resume (batch_checkpoint.json).
+  - DB-level duplicate skip (safety net against stale checkpoints).
+  - Rolling-window ETA.
+  - Persistent keep_alive + small num_ctx for throughput.
 """
 
 import json
-import time
-import ollama
-from itertools import product
-from typing import List, Dict
-from collections import deque
+import os
 import sqlite3
+import sys
+import time
+from collections import deque
+from typing import Dict, List, Tuple
 
-class Pictogram:
-    def __init__(self, name: str, language: str):
-        self.name = name
-        self.language = language
+import ollama
+
+# Make project/python importable so we can reuse CombinationGenerator.
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_PY = os.path.join(REPO_ROOT, "project", "python")
+sys.path.insert(0, PROJECT_PY)
+
+from combination_generator import CombinationGenerator  # noqa: E402
 
 
+# ------------------------------
 # Configuration
-MODEL_NAME = "catalan-composer"
+# ------------------------------
+MODEL_NAME = "cat-composer"
 BATCH_SIZE = 10  # Commit + checkpoint every N items (lower = safer resume)
-OUTPUT_DB = "pictogram_phrases.db"
-CHECKPOINT_FILE = "batch_checkpoint.json"
-KEEP_ALIVE = "24h"  # Keep model loaded in VRAM for the whole run
+KEEP_ALIVE = "24h"
 
-# Ollama options optimized for batch processing
+PICTOS_DB = os.path.join(REPO_ROOT, "project", "output", "pictos.db")
+OUTPUT_DB = os.path.join(REPO_ROOT, "pictogram_phrases.db")
+CHECKPOINT_FILE = os.path.join(REPO_ROOT, "batch_checkpoint.json")
+
+TARGET_LANGUAGES = ["ca"]  # add "es" later once word_es is populated
+
 GENERATION_OPTIONS = {
     "temperature": 0.3,
     "top_p": 0.9,
     "top_k": 40,
     "num_predict": 25,
-    "num_ctx": 256,  # Small context window = faster (prompts are tiny)
+    "num_ctx": 256,
 }
 
-# Example pictogram vocabulary (expand this!)
-SUBJECTS = ["jo", "tu", "ell", "ella", "nosaltres", "yo", "tú", "él", "ella", "nosotros"]
-VERBS = ["voler", "tenir", "ser", "estar", "anar", "querer", "tener", "ir", "comer", "beber"]
-OBJECTS = ["aigua", "sopa", "pa", "llet", "menjar", "agua", "comida", "pan", "leche"]
-MODIFIERS = ["molt", "poc", "ara", "després", "mucho", "poco", "ahora", "después"]
 
-def init_database():
-    """Initialize SQLite database for storing generated phrases"""
+# ------------------------------
+# DB setup
+# ------------------------------
+def init_phrases_db() -> sqlite3.Connection:
     conn = sqlite3.connect(OUTPUT_DB)
-    cursor = conn.cursor()
-    cursor.execute('''
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS phrases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             pictos TEXT NOT NULL,
@@ -53,167 +74,190 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(pictos, language)
         )
-    ''')
+    """)
     conn.commit()
     return conn
 
-def load_checkpoint():
-    """Load checkpoint to resume interrupted batch"""
+
+def load_translation_map(language: str) -> Dict[str, str]:
+    """Return {english_word: translation} for the given target language."""
+    column = f"word_{language}"
+    conn = sqlite3.connect(PICTOS_DB)
+    cur = conn.cursor()
+    cur.execute(f"SELECT word, {column} FROM pictos WHERE {column} IS NOT NULL")
+    mapping = {row[0]: row[1] for row in cur.fetchall()}
+    conn.close()
+    return mapping
+
+
+# ------------------------------
+# Checkpoint helpers
+# ------------------------------
+def load_checkpoint() -> dict:
     try:
-        with open(CHECKPOINT_FILE, 'r') as f:
+        with open(CHECKPOINT_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
         return {"processed": 0, "total": 0}
 
-def save_checkpoint(processed, total):
-    """Save checkpoint for resuming"""
-    with open(CHECKPOINT_FILE, 'w') as f:
+
+def save_checkpoint(processed: int, total: int) -> None:
+    with open(CHECKPOINT_FILE, "w") as f:
         json.dump({"processed": processed, "total": total}, f)
 
-def generate_combinations() -> List[List[str]]:
-    """Generate all pictogram combinations"""
-    combinations = []
-    
-    # 2-word combinations: subject + verb
-    for subj, verb in product(SUBJECTS, VERBS):
-        combinations.append([subj, verb])
-    
-    # 3-word combinations: subject + verb + object
-    for subj, verb, obj in product(SUBJECTS, VERBS, OBJECTS):
-        combinations.append([subj, verb, obj])
-    
-    # 4-word combinations: subject + verb + object + modifier
-    for subj, verb, obj, mod in product(SUBJECTS, VERBS, OBJECTS, MODIFIERS):
-        combinations.append([subj, verb, obj, mod])
-    
-    return combinations
 
-def detect_language(pictos: List[str]) -> str:
-    """Detect language from pictograms"""
-    catalan_words = {"jo", "voler", "tenir", "aigua", "sopa", "molt", "poc"}
-    spanish_words = {"yo", "querer", "tener", "agua", "comida", "mucho", "poco"}
-    
-    pictos_set = set(p.lower() for p in pictos)
-    
-    if pictos_set & catalan_words:
-        return "ca"
-    elif pictos_set & spanish_words:
-        return "es"
-    return "ca"  # default
+# ------------------------------
+# Job building
+# ------------------------------
+def build_jobs() -> List[Tuple[str, str, str, str, str]]:
+    """Return a deterministic list of jobs.
 
-def batch_generate(combinations: List[List[str]], conn: sqlite3.Connection):
-    """Generate phrases for all combinations"""
+    Each job: (pronoun_en, verb_en, language, pronoun_local, verb_local)
+    Pairs whose translations are missing are silently skipped — they will
+    show up in `get_stats()` as untranslated rows.
+    """
+    pairs = CombinationGenerator(PICTOS_DB).generate_subject_verb_combinations()
+    jobs: List[Tuple[str, str, str, str, str]] = []
+    for language in TARGET_LANGUAGES:
+        translations = load_translation_map(language)
+        for pronoun_en, verb_en in pairs:
+            p_loc = translations.get(pronoun_en)
+            v_loc = translations.get(verb_en)
+            if not p_loc or not v_loc:
+                continue
+            jobs.append((pronoun_en, verb_en, language, p_loc, v_loc))
+    return jobs
+
+
+# ------------------------------
+# Main batch loop
+# ------------------------------
+def batch_generate(jobs: List[Tuple[str, str, str, str, str]], conn: sqlite3.Connection) -> None:
     checkpoint = load_checkpoint()
-    start_idx = checkpoint["processed"]
-    total = len(combinations)
+    start_idx = checkpoint["processed"] if checkpoint.get("total") == len(jobs) else 0
+    total = len(jobs)
 
-    # Load already-stored (pictos, language) pairs so we can skip them even if
-    # the checkpoint is behind the actual DB state.
     cursor = conn.cursor()
     cursor.execute("SELECT pictos, language FROM phrases")
     already_done = {(r[0], r[1]) for r in cursor.fetchall()}
 
-    print(f"🚀 Starting batch generation")
-    print(f"📊 Total combinations: {total}")
-    print(f"✅ Already processed (checkpoint): {start_idx}")
-    print(f"💾 Already in DB: {len(already_done)}")
-    print(f"⏳ Remaining: {total - start_idx}\n")
+    print("🚀 Starting batch generation")
+    print(f"📊 Total jobs:                {total}")
+    print(f"✅ Checkpoint processed:      {start_idx}")
+    print(f"💾 Already in DB:             {len(already_done)}")
+    print(f"⏳ Remaining (at most):       {total - start_idx}\n")
 
     start_time = time.time()
-    # Rolling window: duration of the last N generations for realistic ETA
     recent_durations = deque(maxlen=max(BATCH_SIZE * 5, 50))
     processed_in_run = 0
+    errors = 0
 
     for i in range(start_idx, total):
-        pictos = combinations[i]
-        input_text = " ".join(pictos)
-        language = detect_language(pictos)
+        pronoun_en, verb_en, language, p_loc, v_loc = jobs[i]
+        key = f"{pronoun_en} {verb_en}"
 
-        # Skip if already in DB (safety net against stale checkpoint)
-        if (input_text, language) in already_done:
+        if (key, language) in already_done:
             continue
 
+        prompt = f"{p_loc} {v_loc}"
         try:
             iter_start = time.time()
             response = ollama.generate(
                 model=MODEL_NAME,
-                prompt=input_text,
+                prompt=prompt,
                 options=GENERATION_OPTIONS,
-                keep_alive=KEEP_ALIVE
+                keep_alive=KEEP_ALIVE,
             )
-            output = response['response'].strip()
+            output = response["response"].strip()
             recent_durations.append(time.time() - iter_start)
             processed_in_run += 1
 
+            if not output or output.upper().startswith("ERROR"):
+                print(f"⚠️  [{i+1}/{total}] {key!r} [{language}] "
+                      f"prompt={prompt!r} -> ERROR, skipped")
+                errors += 1
+                continue
+
             cursor.execute(
-                "INSERT OR REPLACE INTO phrases (pictos, language, output) VALUES (?, ?, ?)",
-                (input_text, language, output)
+                "INSERT OR REPLACE INTO phrases (pictos, language, output) "
+                "VALUES (?, ?, ?)",
+                (key, language, output),
             )
 
-            # Commit + checkpoint + progress every BATCH_SIZE items
             if (i + 1) % BATCH_SIZE == 0:
                 conn.commit()
                 save_checkpoint(i + 1, total)
 
                 elapsed = time.time() - start_time
                 avg_rate = processed_in_run / elapsed if elapsed > 0 else 0
-                if recent_durations:
-                    recent_rate = len(recent_durations) / sum(recent_durations)
-                else:
-                    recent_rate = avg_rate
+                recent_rate = (len(recent_durations) / sum(recent_durations)
+                               if recent_durations else avg_rate)
                 remaining = (total - i - 1) / recent_rate if recent_rate > 0 else 0
 
-                print(f"✅ {i + 1}/{total} ({(i+1)/total*100:.1f}%) | "
+                print(f"✅ {i+1}/{total} ({(i+1)/total*100:.1f}%) | "
                       f"Recent: {recent_rate:.2f}/s | Avg: {avg_rate:.2f}/s | "
                       f"ETA: {remaining/60:.1f}min | "
-                      f"Last: {input_text} → {output}")
+                      f"Last [{language}] {prompt!r} → {output!r}")
 
-        except Exception as e:
-            print(f"❌ Error processing {input_text}: {e}")
+        except Exception as exc:
+            print(f"❌ Error processing {prompt!r} [{language}]: {exc}")
+            errors += 1
             continue
-    
-    # Final commit
+
     conn.commit()
     save_checkpoint(total, total)
-    
-    elapsed = time.time() - start_time
-    print(f"\n🎉 Batch generation complete!")
-    print(f"⏱️  Total time: {elapsed/60:.1f} minutes")
-    print(f"📊 Processed: {total} combinations")
-    print(f"⚡ Average rate: {total/elapsed:.2f} phrases/second")
-    print(f"💾 Database: {OUTPUT_DB}")
 
-def main():
-    print("🔥 Warming up model...")
+    elapsed = time.time() - start_time
+    print("\n🎉 Batch generation complete!")
+    print(f"⏱️  Total time:     {elapsed/60:.1f} minutes")
+    print(f"📊 Jobs:           {total}")
+    print(f"⚠️  Errors:         {errors}")
+    print(f"💾 Database:       {OUTPUT_DB}")
+
+
+def warmup_model() -> bool:
+    print(f"🔥 Warming up model: {MODEL_NAME}...")
     try:
         ollama.generate(
             model=MODEL_NAME,
-            prompt="test",
-            options={"num_predict": 1},
-            keep_alive=KEEP_ALIVE
+            prompt="jo voler",
+            options={"num_predict": 1, "num_ctx": 256},
+            keep_alive=KEEP_ALIVE,
         )
         print("✅ Model ready!\n")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        print("Make sure Ollama is running and model is pulled")
-        return
-    
-    # Initialize database
-    conn = init_database()
-    
-    # Generate combinations
-    print("📝 Generating combinations...")
-    combinations = generate_combinations()
-    print(f"✅ Generated {len(combinations)} combinations\n")
-    
-    # Estimate time
-    estimated_time = len(combinations) * 0.15 / 60  # 150ms per phrase
-    print(f"⏱️  Estimated time: {estimated_time:.1f} minutes\n")
-    
-    # Run batch generation
-    batch_generate(combinations, conn)
-    
-    conn.close()
+        return True
+    except Exception as exc:
+        print(f"❌ Warmup failed: {exc}")
+        print("   Make sure Ollama is running and "
+              f"`ollama create {MODEL_NAME} -f Modelfile_cat_composer` has been run.")
+        return False
+
+
+def main() -> int:
+    if not os.path.exists(PICTOS_DB):
+        print(f"❌ pictos.db not found at {PICTOS_DB}")
+        return 1
+
+    if not warmup_model():
+        return 1
+
+    conn = init_phrases_db()
+    try:
+        print("📝 Building job list from pictos.db...")
+        jobs = build_jobs()
+        if not jobs:
+            print("❌ No jobs to run. Have you populated word_ca "
+                  "via translate_pictos.py?")
+            return 1
+        print(f"✅ Built {len(jobs)} jobs "
+              f"({len(TARGET_LANGUAGES)} language(s))\n")
+
+        batch_generate(jobs, conn)
+    finally:
+        conn.close()
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
